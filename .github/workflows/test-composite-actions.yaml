@@ -1,256 +1,164 @@
-name: test-composite-actions
+name: clang-tidy-before-after
 
 on:
-  pull_request:
-  schedule:
-    - cron: 0 0 * * *
   workflow_dispatch:
 
 jobs:
-  test-register-autonomoustuff-repository:
+  evidence:
+    name: ${{ matrix.distro }} / ${{ matrix.scenario.name }}
     runs-on: ubuntu-latest
-    container: ros:${{ matrix.rosdistro }}
+    container: ros:${{ matrix.distro }}
     strategy:
       fail-fast: false
       matrix:
-        rosdistro:
-          - humble
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Run register-autonomoustuff-repository
-        uses: ./register-autonomoustuff-repository
-        with:
-          rosdistro: ${{ matrix.rosdistro }}
-
-      - name: Install pacmod3_msgs
-        run: |
-          sudo apt-get install -y ros-${{ matrix.rosdistro }}-pacmod3-msgs
-
-      - name: Check rosdep
-        run: |
-          rosdep update
-          rosdep resolve pacmod3_msgs
-
-  test-clang-tidy-empty-target:
-    runs-on: ubuntu-latest
-    container: ros:${{ matrix.rosdistro }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rosdistro:
-          - humble
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Run clang-tidy
-        uses: ./clang-tidy
-        with:
-          rosdistro: ${{ matrix.rosdistro }}
-          target-packages: empty_target_cmake
-          clang-tidy-config-url: https://raw.githubusercontent.com/autowarefoundation/autoware/main/.clang-tidy
-
-  test-clang-tidy-source-directory:
-    runs-on: ubuntu-latest
-    container: ros:${{ matrix.rosdistro }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rosdistro: [humble, jazzy]
-        layout: [root, nested]
+        distro: [humble, jazzy]
+        scenario:
+          - name: before-root
+            revision: 14a021944448062faaaf5b3b4d8255b899a7c94d
+            layout: root
+            explicit: false
+            supported: true
+          - name: after-root
+            revision: 5b5c3905729c70c82188f00a191e47fe7315bdba
+            layout: root
+            explicit: false
+            supported: true
+          - name: before-nested
+            revision: 14a021944448062faaaf5b3b4d8255b899a7c94d
+            layout: nested
+            explicit: false
+            supported: false
+          - name: after-nested-default
+            revision: 5b5c3905729c70c82188f00a191e47fe7315bdba
+            layout: nested
+            explicit: false
+            supported: false
+          - name: after-nested
+            revision: 5b5c3905729c70c82188f00a191e47fe7315bdba
+            layout: nested
+            explicit: true
+            supported: true
     env:
-      SOURCE_DIRECTORY: ${{ matrix.layout == 'root' && '.' || 'src/fixture_repo' }}
+      EVIDENCE_CASE: ${{ matrix.scenario.name }}
+      ACTION_REVISION: ${{ matrix.scenario.revision }}
+      EVIDENCE_DISTRO: ${{ matrix.distro }}
+      EXPLICIT_SOURCE: ${{ matrix.scenario.explicit }}
+      SOURCE_DIRECTORY: ${{ matrix.scenario.layout == 'root' && '.' || 'src/clang_tidy_fixture' }}
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
+      - uses: actions/checkout@v7
 
-      - name: Prepare source directory fixture
+      - name: Check out the exact action revision
+        uses: actions/checkout@v7
+        with:
+          repository: ${{ startsWith(matrix.scenario.name, 'before-') && 'autowarefoundation/autoware-github-actions' || 'xmfcx/autoware-github-actions' }}
+          ref: ${{ matrix.scenario.revision }}
+          path: .action-under-test
+          sparse-checkout: clang-tidy
+
+      - name: Prepare a package at the checkout root
         id: fixture
         run: |
           bash tests/prepare-clang-tidy-source-directory.sh
+          mv "$SOURCE_DIRECTORY/fixture_package/"* "$SOURCE_DIRECTORY/"
+          rmdir "$SOURCE_DIRECTORY/fixture_package"
+          printf './checks/ignored.cpp\n*/wildcard_ignored.cpp\n' > "$SOURCE_DIRECTORY/.clang-tidy-ignore"
           echo "config-url=file://${RUNNER_TEMP}/source-directory-clang-tidy.yaml" >> "$GITHUB_OUTPUT"
 
-      - name: Run clang-tidy without source-directory
-        if: matrix.layout == 'root'
-        uses: ./clang-tidy
+      - name: Run the action with source-directory omitted
+        id: default
+        if: ${{ !matrix.scenario.explicit }}
+        continue-on-error: ${{ !matrix.scenario.supported }}
+        uses: ./.action-under-test/clang-tidy
         with:
-          rosdistro: ${{ matrix.rosdistro }}
+          rosdistro: ${{ matrix.distro }}
           target-packages: clang_tidy_source_fixture
           clang-tidy-config-url: ${{ steps.fixture.outputs.config-url }}
-          cache-key-element: source-directory-${{ matrix.layout }}
-          artifact-name: clang-tidy-source-${{ matrix.rosdistro }}-${{ matrix.layout }}
+          cache-key-element: before-after-${{ github.run_id }}-${{ matrix.scenario.name }}
+          artifact-name: positive-${{ matrix.distro }}-${{ matrix.scenario.name }}
 
-      - name: Run clang-tidy with source-directory
-        if: matrix.layout == 'nested'
-        uses: ./clang-tidy
+      - name: Run the action with source-directory set
+        id: source
+        if: matrix.scenario.explicit
+        uses: ./.action-under-test/clang-tidy
         with:
-          rosdistro: ${{ matrix.rosdistro }}
+          rosdistro: ${{ matrix.distro }}
           source-directory: ${{ env.SOURCE_DIRECTORY }}
           target-packages: clang_tidy_source_fixture
           clang-tidy-config-url: ${{ steps.fixture.outputs.config-url }}
-          cache-key-element: source-directory-${{ matrix.layout }}
-          artifact-name: clang-tidy-source-${{ matrix.rosdistro }}-${{ matrix.layout }}
+          cache-key-element: before-after-${{ github.run_id }}-${{ matrix.scenario.name }}
+          artifact-name: positive-${{ matrix.distro }}-${{ matrix.scenario.name }}
 
-      - name: Check source and workspace separation
-        shell: bash
+      - name: Capture and verify positive or unsupported-layout evidence
+        if: always()
+        env:
+          ACTION_OUTCOME: ${{ matrix.scenario.explicit && steps.source.outcome || steps.default.outcome }}
+          LEGACY_CONFIG_HASH: ${{ hashFiles('.clang-tidy') }}
+          SELECTED_CONFIG_HASH: ${{ hashFiles(format('{0}/.clang-tidy', env.SOURCE_DIRECTORY)) }}
+        run: python3 tests/clang-tidy-evidence.py capture positive
+
+      - name: Introduce a lint violation
+        if: matrix.scenario.supported
         run: |
-          cmp "${RUNNER_TEMP}/source-directory-clang-tidy.yaml" "${SOURCE_DIRECTORY}/.clang-tidy"
-          test ! -L "${SOURCE_DIRECTORY}/.clang-tidy"
-          test -f build/compile_commands.json
-          grep -F '/checks/checked.cpp' /tmp/clang-tidy-result/report.log
-          if grep -E '/checks/(ignored|wildcard_ignored|test/ignored_test)\.cpp' /tmp/clang-tidy-result/report.log; then
-            echo 'An ignored source file was analyzed'
-            exit 1
-          fi
-          if [ "$SOURCE_DIRECTORY" != '.' ]; then
-            test ! -e "${SOURCE_DIRECTORY}/build"
-            test ! -e "${SOURCE_DIRECTORY}/log"
-          fi
-          # Prove the selected config also rejects a regression.
-          source_file="${SOURCE_DIRECTORY}/fixture_package/checks/checked.cpp"
-          printf 'int *checked = 0;\n' > "$source_file"
-          if clang-tidy -p "$GITHUB_WORKSPACE/build" "$source_file" > "$RUNNER_TEMP/negative.log" 2>&1; then
-            echo 'clang-tidy accepted a deliberate modernize-use-nullptr violation'
-            exit 1
-          fi
-          grep -F 'modernize-use-nullptr' "$RUNNER_TEMP/negative.log"
+          printf 'int *checked = 0;\n' > "$SOURCE_DIRECTORY/checks/checked.cpp"
+          rm -rf /tmp/clang-tidy-result
 
-  test-check-file-existence:
+      - name: Reject the violation with source-directory omitted
+        id: negative-default
+        if: ${{ matrix.scenario.supported && !matrix.scenario.explicit }}
+        continue-on-error: true
+        uses: ./.action-under-test/clang-tidy
+        with:
+          rosdistro: ${{ matrix.distro }}
+          target-packages: clang_tidy_source_fixture
+          target-files: ./checks/checked.cpp ./checks/ignored.cpp ./checks/wildcard_ignored.cpp ./checks/test/ignored_test.cpp
+          clang-tidy-config-url: ${{ steps.fixture.outputs.config-url }}
+          cache-key-element: before-after-${{ github.run_id }}-${{ matrix.scenario.name }}
+          artifact-name: negative-${{ matrix.distro }}-${{ matrix.scenario.name }}
+
+      - name: Reject the violation with source-directory set
+        id: negative-source
+        if: matrix.scenario.explicit
+        continue-on-error: true
+        uses: ./.action-under-test/clang-tidy
+        with:
+          rosdistro: ${{ matrix.distro }}
+          source-directory: ${{ env.SOURCE_DIRECTORY }}
+          target-packages: clang_tidy_source_fixture
+          target-files: ./checks/checked.cpp ./checks/ignored.cpp ./checks/wildcard_ignored.cpp ./checks/test/ignored_test.cpp
+          clang-tidy-config-url: ${{ steps.fixture.outputs.config-url }}
+          cache-key-element: before-after-${{ github.run_id }}-${{ matrix.scenario.name }}
+          artifact-name: negative-${{ matrix.distro }}-${{ matrix.scenario.name }}
+
+      - name: Capture and verify the action rejects the violation
+        if: ${{ always() && matrix.scenario.supported }}
+        env:
+          ACTION_OUTCOME: ${{ matrix.scenario.explicit && steps.negative-source.outcome || steps.negative-default.outcome }}
+          LEGACY_CONFIG_HASH: ${{ hashFiles('.clang-tidy') }}
+          SELECTED_CONFIG_HASH: ${{ hashFiles(format('{0}/.clang-tidy', env.SOURCE_DIRECTORY)) }}
+        run: python3 tests/clang-tidy-evidence.py capture negative
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: before-after-${{ matrix.distro }}-${{ matrix.scenario.name }}
+          path: evidence/
+
+  compare:
+    name: Compare upstream and candidate behavior
+    needs: evidence
+    if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Create temporary files
-        run: |
-          touch foo
-          touch bar
-
-      - name: Run check-file-existence
-        id: check-file-existence1
-        uses: ./check-file-existence
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
-          files: |
-            foo
-            bar
-          condition: and
-
-      - name: Check result
-        run: |
-          [[ "${{ steps.check-file-existence1.outputs.exists }}" == "true" ]]
-
-      - name: Run check-file-existence
-        id: check-file-existence2
-        uses: ./check-file-existence
+          pattern: before-after-*
+          path: evidence-results
+      - name: Require equivalent default behavior and working nested sources
+        run: python3 tests/clang-tidy-evidence.py compare evidence-results
+      - uses: actions/upload-artifact@v7
+        if: always()
         with:
-          files: |
-            foo
-            bar
-            baz
-          condition: and
-
-      - name: Check result
-        run: |
-          [[ "${{ steps.check-file-existence2.outputs.exists }}" == "false" ]]
-
-      - name: Run check-file-existence
-        id: check-file-existence3
-        uses: ./check-file-existence
-        with:
-          files: foo
-          condition: or
-
-      - name: Check result
-        run: |
-          [[ "${{ steps.check-file-existence3.outputs.exists }}" == "true" ]]
-
-      - name: Run check-file-existence
-        id: check-file-existence4
-        uses: ./check-file-existence
-        with:
-          files: |
-            foo
-            baz
-          condition: or
-
-      - name: Check result
-        run: |
-          [[ "${{ steps.check-file-existence4.outputs.exists }}" == "true" ]]
-
-  test-colcon-build-and-colcon-test:
-    runs-on: ubuntu-latest
-    container: ros:${{ matrix.rosdistro }}
-    strategy:
-      fail-fast: false
-      matrix:
-        rosdistro:
-          - humble
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Run colcon-build
-        uses: ./colcon-build
-        with:
-          rosdistro: ${{ matrix.rosdistro }}
-          target-packages: empty_target_cmake empty_target_python
-
-      - name: Run colcon-test
-        uses: ./colcon-test
-        with:
-          rosdistro: ${{ matrix.rosdistro }}
-          target-packages: empty_target_cmake empty_target_python
-
-  test-get-self-packages-and-get-modified-packages:
-    runs-on: ubuntu-latest
-    container: ${{ matrix.container }}
-    strategy:
-      fail-fast: false
-      matrix:
-        container:
-          - ros:humble
-          - ghcr.io/autowarefoundation/autoware:universe-devel
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Set git config
-        uses: autowarefoundation/autoware-github-actions/set-git-config@v1
-
-      - name: Workaround for https://github.com/actions/checkout/issues/766
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Modify packages
-        run: |
-          echo "" >> tests/dummy_packages/empty_target_cmake/package.xml
-          git add .
-          git commit -m "modify packages"
-
-      - name: Clear workaround
-        run: |
-          git config --global --unset safe.directory
-
-      - name: Run get-self-packages
-        id: get-self-packages
-        uses: ./get-self-packages
-
-      - name: Check result of get-self-packages
-        run: |
-          [[ "${{ steps.get-self-packages.outputs.self-packages }}" == "empty_target_cmake empty_target_python" ]]
-        shell: bash
-
-      - name: Run get-modified-packages
-        id: get-modified-packages
-        uses: ./get-modified-packages
-        with:
-          base-branch: main
-
-      - name: Check result of get-modified-packages
-        run: |
-          [[ "${{ steps.get-modified-packages.outputs.modified-packages }}" == "empty_target_cmake" ]]
-        shell: bash
+          name: before-after-summary
+          path: evidence-results/summary.*
