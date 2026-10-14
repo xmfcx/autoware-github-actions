@@ -1,0 +1,38 @@
+name: test-require-label
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - labeled
+
+# Same token as a repository with the restricted default, for example cuda_blackboard.
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Read the labels with REST and with GraphQL
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "REST:"
+          gh api "repos/$GITHUB_REPOSITORY/issues/$PR_NUMBER/labels" --jq '[.[].name]' || true
+          echo "GraphQL:"
+          gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '[.labels[].name]' || true
+        shell: bash
+
+  require-label-present:
+    uses: ./.github/workflows/require-label.yaml
+    with:
+      label: bug
+
+  require-label-missing:
+    uses: ./.github/workflows/require-label.yaml
+    with:
+      label: run:missing-label
